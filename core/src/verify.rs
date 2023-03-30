@@ -2,6 +2,7 @@ use crate::reserved::ReservedState;
 use crate::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::mem;
 use thiserror::Error;
 
 #[derive(Error, Debug, Clone)]
@@ -187,24 +188,36 @@ impl CommitSequenceVerifier {
 
     /// Verifies whether the given reserved state is valid from the current state.
     pub fn verify_reserved_state(&self, rs: &ReservedState) -> Result<(), Error> {
+        // 1. Check that the number of members is at least 4.
         if rs.members.len() < 4 {
             return Err(Error::InvalidArgument(format!("Number of members is not over 4")));
         }
+        // 2. Check that the version advances correctly.
         if self.reserved_state.version != rs.version {
             if !(self.reserved_state.version < rs.version && verify_version_syntax(&rs.version)) {
                 return Err(Error::InvalidArgument(format!("Version advances is incorrect")));
             }
         }
-        let validator_set: Vec<MemberName> = rs.members.iter().filter(|m| m.expelled == false).map(|m| m.name).collect();
-        if rs.consensus_leader_order != validator_set {
+        // 3. Check that `consensus_leader_order` is correct.
+        let validator_set: Vec<MemberName> = rs
+            .get_validator_set()
+            .expect("get_validator_set occur error")
+            .iter()
+            .map(|menber| rs.query_name(&menber.0).expect("query_name occur error"))
+            .into_iter()
+            .collect();
+        if !(rs.consensus_leader_order.iter().all(|menber| validator_set.contains(menber))) {
             return Err(Error::InvalidArgument(format!("Consensus leader order is incorrect")));
         }
+        // 4. Check that `genesis_info` stays the same.
         if self.reserved_state.genesis_info != rs.genesis_info {
             return Err(Error::InvalidArgument(format!("Genesis_info is not stays the same")));
         }
+        // 6. Check that `member` monotonicaly increases (refer to `Member::expelled`).
         if !self.reserved_state.members.iter().all(|m1| rs.members.iter().any(|m2| m1.public_key == m2.public_key)) {
             return Err(Error::InvalidArgument(format!("New member set do not have all previous member")));
         }
+        // 5. Check that the newly added (if exists) `Member::name` is unique.
         let public_key_set: HashSet<&PublicKey> = rs.members.iter().map(|m| &m.public_key).collect();
         if public_key_set.len() != rs.members.len() {
             return Err(Error::InvalidArgument(format!("Newly added member public keys are not unique")));
@@ -279,7 +292,7 @@ impl CommitSequenceVerifier {
                 }
                 // Update reserved_state for reserved-diff transactions.
                 if let Diff::Reserved(rs) = &tx.diff {
-                    self.verify_reserved_state(rs)?
+                    self.verify_reserved_state(rs)?;
                     self.reserved_state = *rs.clone();
                 }
                 let mut preceding_transactions = preceding_transactions.clone();
