@@ -8,6 +8,9 @@ pub struct PayloadCommit {
     pub commit: RawCommit,
     pub hash: CommitHash,
     pub parent_hash: CommitHash,
+    // 순서를 정렬하려면 브랜치 별로 구분하기 위한 고유 식별자와 index가 필요함
+    pub branch_name: String,
+    pub index: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,12 +89,17 @@ pub async fn flush(
             _dms.write().await.commit_message(&message).await?;
 
             // 위에서 PayloadBranch를 commit_message로 보내는 것처럼 PayloadCommit에 대해 commit_message을 보내야함
-            for commit_hash in commit_hashes {
+            // query_commit_path가 descendant를 include하는데, 그러면 last_finalized_commit_hash도 받아오는건가?
+            let mut prev_commit = last_finalized_commit_hash;
+            for (_index, commit_hash) in commit_hashes.iter().enumerate() {
                 let payload_commit = PayloadCommit {
-                    commit: _raw.write().await.read_commit(commit_hash).await?,
-                    hash: commit_hash,
-                    parent_hash: last_finalized_commit_hash,
+                    commit: _raw.write().await.read_commit(*commit_hash).await?,
+                    hash: *commit_hash,
+                    parent_hash: prev_commit,
+                    branch_name: branch.clone(),
+                    index: _index,
                 };
+                prev_commit = *commit_hash;
 
                 let message = Message::Commit(payload_commit);
                 _dms.write().await.commit_message(&message).await?;
@@ -113,12 +121,16 @@ pub async fn flush(
             let message = Message::Branch(payload_branch);
             _dms.write().await.commit_message(&message).await?;
 
-            for commit_hash in commit_hashes {
+            let mut prev_commit = last_finalized_commit_hash;
+            for (_index, commit_hash) in commit_hashes.iter().enumerate() {
                 let payload_commit = PayloadCommit {
-                    commit: _raw.write().await.read_commit(commit_hash).await?,
-                    hash: commit_hash,
-                    parent_hash: last_finalized_commit_hash,
+                    commit: _raw.write().await.read_commit(*commit_hash).await?,
+                    hash: *commit_hash,
+                    parent_hash: prev_commit,
+                    branch_name: branch.clone(),
+                    index: _index,
                 };
+                prev_commit = *commit_hash;
 
                 let message = Message::Commit(payload_commit);
                 _dms.write().await.commit_message(&message).await?;
@@ -146,9 +158,11 @@ pub async fn flush(
    4.
 */
 
+// 근데 걍 PayloadCommitSequence를 보내면 안되나?
 pub async fn update(
     _raw: Arc<RwLock<RawRepository>>,
     _dms: Arc<RwLock<Dms<Message>>>,
+    _commit_buffer: &mut std::collections::HashMap<String, Vec<PayloadCommit>>,
 ) -> Result<(), Error> {
     let messages = _dms.write().await.read_messages().await?;
     let last_message = messages.last().unwrap().clone().message;
@@ -156,7 +170,6 @@ pub async fn update(
     // 확인해야 할 부분 :
     // semantic commit을 만들어서 raw에 업데이트 하는 과정을 for문 안에서 create_semantic_commit을 하는 식으로 처리했는데,
     // 이렇게 하는 방식이 맞는가?
-
     match last_message {
         Message::Branch(payloadbranch) => {
             let commit_hashes = payloadbranch.commit_hashes; // sender가 보낸 commit hash들
@@ -180,6 +193,7 @@ pub async fn update(
 
             for commit in commit_hashes {
                 // 모든 받아온 commit hash들에 대해서 semantic commit을 만들어서 local repo를 업데이트 시킨다.
+                // 이 부분은 어떤 다른 함수를 써야 되는지 모르겠어서 못건들였음
                 let semantic_commit = _raw.write().await.read_semantic_commit(commit).await?;
                 _raw.write()
                     .await
@@ -187,15 +201,18 @@ pub async fn update(
                     .await?;
             }
         }
-        // Commit에는 내용이랑 prev hash만 담겨있어서 여기에 해당하는 branch가 도착했는지 알 수 없음
-        // Branch가 먼저 도착하면 그걸로 틀을 만들고 commit을 넣어야 될 것 같은데
-        Message::Commit(Payloadcommit) => {
-            let commit = Payloadcommit.commit;
-            let commit_hash = Payloadcommit.hash;
-            let parent_hash = Payloadcommit.parent_hash;
+        Message::Commit(payloadcommit) => {
+            let branch_name = payloadcommit.branch_name.clone();
+            let index = payloadcommit.index;
 
-            //해당 커밋의 branch가 먼저 도착해는지 확인하는 과정
-            //????
+            // PayloadCommit Reassembling
+            if let Some(vec) = _commit_buffer.get_mut(&branch_name).as_mut() {
+                vec[index] = payloadcommit.clone();
+            } else {
+                let mut vec: Vec<PayloadCommit> = Vec::new();
+                vec[index] = payloadcommit.clone();
+                _commit_buffer.insert(branch_name.clone(), vec);
+            }
 
             let last_finalized_commit_hash = _raw
                 .write()
@@ -203,35 +220,58 @@ pub async fn update(
                 .locate_branch(FINALIZED_BRANCH_NAME.into())
                 .await?;
 
-            if parent_hash == last_finalized_commit_hash {
-                // Receiver가 모르는 새로운 branch를 받는 과정 -> PayloadBranch가 왔는지 확인해야함
-                let semantic_commit = _raw.write().await.read_semantic_commit(commit_hash).await?;
-                _raw.write()
-                    .await
-                    .create_semantic_commit(semantic_commit)
-                    .await?;
-            } else {
-                let branches = _raw
+            let branches = _raw
+                .write()
+                .await
+                .get_branches(last_finalized_commit_hash)
+                .await?;
+
+            for branch in branches {
+                let end_commit_hash = _raw.write().await.locate_branch(branch.clone()).await?;
+                let bn_commit_hashes = _raw
                     .write()
                     .await
-                    .get_branches(last_finalized_commit_hash)
+                    .query_commit_path(end_commit_hash, last_finalized_commit_hash)
                     .await?;
+                let commit_series = _commit_buffer.get(&branch).unwrap();
 
-                for branch in branches {
-                    let final_commit_hash =
-                        _raw.write().await.locate_branch(branch.clone()).await?;
-                    if final_commit_hash == parent_hash {
+                // PayloadBranch와 PayloadCommitSequence의 길이가 다르면 아직 덜 도착한 것이므로 continue
+                if bn_commit_hashes.len() != commit_series.len() {
+                    continue;
+                }
+                // 개수가 맞다면 대략 다 도착한 것이므로, 순서 맞는지와 parent관계 맞는지 확인
+                // 처음에 Finalized hash value부터 비교
+                if last_finalized_commit_hash != commit_series[0].parent_hash
+                    || bn_commit_hashes[0] != commit_series[0].hash
+                {
+                    continue;
+                }
+                //repo에 적용할 준비가 되었는지 확인하는 변수
+                let is_ready =
+                    bn_commit_hashes
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .all(|(_index, commit_hash)| {
+                            *commit_hash == commit_series[_index].hash
+                                && bn_commit_hashes[_index - 1] == commit_series[_index].parent_hash
+                        });
+
+                if is_ready {
+                    // 지금 commit_series에는 순서대로 commit들이 들어있다는 거
+                    // 이제 이걸로 semantic commit을 만들어서 local repo를 업데이트 시키면 됨
+                    // 이후에 hashmap 비워주면 됨
+                    for commit in commit_series {
                         let semantic_commit =
-                            _raw.write().await.read_semantic_commit(commit_hash).await?;
+                            _raw.write().await.read_semantic_commit(commit.hash).await?;
                         _raw.write()
                             .await
                             .create_semantic_commit(semantic_commit)
                             .await?;
-                        break;
                     }
+                    _commit_buffer.remove(&branch);
                 }
             }
-
             todo!()
         }
     };
